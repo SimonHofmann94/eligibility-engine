@@ -224,3 +224,34 @@ def record_evaluation(
     session.add(rec)
     session.flush()
     return rec
+
+
+def list_evaluations(session: Session, name: str, limit: int = 50):
+    """Newest-first evaluation history for one rule set, as
+    (EvaluationRecord, version_number) pairs."""
+    # ponytail: hardcoded limit, no pagination — add offset if history grows.
+    # id desc, not created_at: SQLite timestamps tie at second resolution.
+    return session.execute(
+        select(EvaluationRecord, RuleSetVersion.version)
+        .join(RuleSetVersion,
+              EvaluationRecord.version_id == RuleSetVersion.id)
+        .join(RuleSet)
+        .where(RuleSet.name == name)
+        .order_by(EvaluationRecord.id.desc())
+        .limit(limit)
+    ).all()
+
+
+def get_evaluation(
+    session: Session, name: str, eval_id: int
+) -> tuple[EvaluationRecord, RuleSetVersion] | None:
+    """One evaluation plus its version row; the name join guards against
+    reading another rule set's records by id."""
+    row = session.execute(
+        select(EvaluationRecord, RuleSetVersion)
+        .join(RuleSetVersion,
+              EvaluationRecord.version_id == RuleSetVersion.id)
+        .join(RuleSet)
+        .where(RuleSet.name == name, EvaluationRecord.id == eval_id)
+    ).first()
+    return (row[0], row[1]) if row else None

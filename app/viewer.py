@@ -13,15 +13,16 @@ Design notes:
 """
 from __future__ import annotations
 
+import difflib
 import html
 import json
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
 from . import storage
-from .compiler import CompiledDocument, compile_document
+from .compiler import CompiledDocument, CompileError, compile_document
 from .evaluator import _OPS, Evaluator
 from .models import (
     AllBlock,
@@ -29,12 +30,16 @@ from .models import (
     AuthoringDocument,
     Comparison,
     ConditionalRequirement,
+    FactInput,
+    FactStatus,
+    ImportSpec,
     NotBlock,
     OneOfBlock,
     RuleRef,
     coerce_facts,
 )
 from .report import STATUS_TO_DECISION, EvaluationReport, RuleResult
+from .statements import DEFAULT_CONFIDENCE_THRESHOLD, Statement, resolve_facts
 
 router = APIRouter(prefix="/ui", include_in_schema=False)
 
@@ -88,6 +93,18 @@ a{color:var(--accent)}
 border-radius:8px;padding:10px 12px;margin:10px 0}
 .vtag{font-size:12px;background:#f1e9fe;color:#6d28d9;border-radius:6px;
 padding:1px 8px;margin-left:6px}
+input[type=text],input[type=number],input:not([type]),select{
+font:13px/1.5 ui-monospace,Consolas,monospace;border:1px solid var(--line);
+border-radius:6px;padding:5px 8px;background:var(--card)}
+details{margin:8px 0}details summary{cursor:pointer;color:var(--mut);
+font-size:13px}details textarea{min-height:90px;margin-top:6px}
+.actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap;
+font-size:13px;margin-top:6px}
+.actions button{margin-top:0;padding:5px 12px;font-size:13px}
+pre.diff{background:var(--card);border:1px solid var(--line);
+border-radius:10px;padding:12px;overflow-x:auto;
+font:12.5px/1.5 ui-monospace,Consolas,monospace}
+.dadd{background:#e6f4ea}.ddel{background:#fdecea}
 """
 
 _DECISION_LABEL = {
@@ -216,13 +233,93 @@ def collect_fact_names(compiled: CompiledDocument) -> list[str]:
     return sorted(names)
 
 
+def _rules_cards(compiled: CompiledDocument, index: dict | None) -> str:
+    if not compiled.rules_by_id:
+        return ""
+    parts = ["<h2>Named rules</h2>"]
+    for rid in sorted(compiled.rules_by_id):
+        rule = compiled.rules_by_id[rid]
+        anchor = esc(rid).replace(":", "--")
+        head = esc(rule.label or rid)
+        sub = (f"<span class='mut'> — {esc(rid)}</span>"
+               if rule.label else "")
+        tree = _render_node(rule.root, f"rule:{rid}", index)
+        result = index.get(f"rule:{rid}") if index else None
+        chip = _chip(result, index is not None)
+        parts.append(
+            f"<div class='card' id='rule-{anchor}'>"
+            f"<div class='row'><span class='lbl'>{head}{sub}</span>"
+            f"{chip}</div>{tree}</div>"
+        )
+    return "".join(parts)
+
+
+def _facts_form(
+    compiled: CompiledDocument,
+    row,
+    report: EvaluationReport | None,
+    facts_json: str | None,
+    statements_json: str | None,
+    threshold: float,
+) -> str:
+    doc = compiled.doc
+    report_facts = report.facts if report else {}
+    fact_rows = []
+    for name in collect_fact_names(compiled):
+        fi = report_facts.get(name)
+        val = ("" if fi is None or fi.value is None
+               else esc(json.dumps(fi.value)))
+        status = fi.status.value if fi is not None else "known"
+        opts = "".join(
+            f"<option value='{s}'{' selected' if s == status else ''}>"
+            f"{s.replace('_', ' ')}</option>"
+            for s in ("known", "unknown", "not_applicable")
+        )
+        fact_rows.append(
+            f"<tr><td>{esc(name)}</td>"
+            f"<td><input name='f:{esc(name)}' value='{val}'></td>"
+            f"<td><select name='s:{esc(name)}'>{opts}</select></td></tr>"
+        )
+
+    if facts_json is None:
+        skeleton = {name: None for name in collect_fact_names(compiled)}
+        facts_json = json.dumps(skeleton, indent=1)
+    if statements_json is None:
+        statements_json = "[]"
+
+    return (
+        f"<div class='card'><div class='hd'>Facts</div>"
+        f"<form method='post' "
+        f"action='/ui/{esc(doc.name)}/evaluate?version={row.version}'>"
+        f"<table><tr><th>Fact</th><th>Value</th><th>Status</th></tr>"
+        f"{''.join(fact_rows)}</table>"
+        f"<div class='mut'>values are parsed as JSON, bare text is fine; "
+        f"empty + known = not provided → unknown</div>"
+        f"<details><summary>Raw JSON / statements (fact rows win over raw "
+        f"facts, raw facts win over statements)</summary>"
+        f"<div class='mut'>facts JSON — null = not provided</div>"
+        f"<textarea name='facts_json'>{esc(facts_json)}</textarea>"
+        f"<div class='mut'>statements JSON — resolved to facts "
+        f"(override &gt; confidence &gt; recency)</div>"
+        f"<textarea name='statements_json'>{esc(statements_json)}</textarea>"
+        f"<label class='mut'>confidence threshold "
+        f"<input type='number' name='confidence_threshold' step='0.05' "
+        f"min='0' max='1' value='{threshold}'></label>"
+        f"</details>"
+        f"<button type='submit'>Evaluate v{row.version}</button></form></div>"
+    )
+
+
 def _document_page(
     row,
     compiled: CompiledDocument,
     all_versions,
     report: EvaluationReport | None = None,
     facts_json: str | None = None,
+    statements_json: str | None = None,
+    threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
     error: str | None = None,
+    note: str | None = None,
 ) -> str:
     doc = compiled.doc
     index = build_result_index(report) if report else None
@@ -235,11 +332,33 @@ def _document_page(
         for v in all_versions
     )
     parts.append(f"<h1>{esc(doc.name)}</h1><div class='mut'>{vtags}</div>")
+
+    actions = [
+        f"<a href='/ui/new?from={esc(doc.name)}&version={row.version}'>"
+        f"Edit as new version</a>",
+        f"<a href='/ui/{esc(doc.name)}/history'>History</a>",
+    ]
+    prior = [v.version for v in all_versions if v.version < row.version]
+    if prior:
+        p = max(prior)
+        actions.append(
+            f"<a href='/ui/{esc(doc.name)}/diff?a={p}&b={row.version}'>"
+            f"diff vs v{p}</a>")
+    promote = ""
+    if row.status == "draft":
+        promote = (
+            f"<form method='post' action='/ui/{esc(doc.name)}/promote"
+            f"?version={row.version}'>"
+            f"<button type='submit'>Promote to published</button></form>")
+    parts.append(f"<div class='actions'>{' '.join(actions)}{promote}</div>")
+
     if doc.description:
         parts.append(f"<p class='mut'>{esc(doc.description)}</p>")
 
     if error:
         parts.append(f"<div class='err'>{esc(error)}</div>")
+    if note:
+        parts.append(f"<p class='mut'>{esc(note)}</p>")
 
     if report:
         text, cls = _DECISION_LABEL[report.decision.value]
@@ -248,19 +367,10 @@ def _document_page(
             f"<span class='chip {cls}'>{esc(text)}</span></div>"
         )
 
-    # Facts form — prefilled with a skeleton of every fact the rules read;
-    # null means "not provided" and evaluates as unknown.
-    if facts_json is None:
-        skeleton = {name: None for name in collect_fact_names(compiled)}
-        facts_json = json.dumps(skeleton, indent=1)
-    parts.append(
-        f"<div class='card'><div class='hd'>Facts</div>"
-        f"<div class='mut'>null = not provided → evaluates as unknown</div>"
-        f"<form method='post' "
-        f"action='/ui/{esc(doc.name)}/evaluate?version={row.version}'>"
-        f"<textarea name='facts_json'>{esc(facts_json)}</textarea>"
-        f"<button type='submit'>Evaluate v{row.version}</button></form></div>"
-    )
+    # Facts form — one row per fact the rules read, prefilled from the
+    # report after an evaluation; raw JSON / statements in <details>.
+    parts.append(_facts_form(compiled, row, report, facts_json,
+                             statements_json, threshold))
 
     if doc.imports:
         rows = "".join(
@@ -273,23 +383,7 @@ def _document_page(
 
     parts.append("<h2>Decision</h2>")
     parts.append(_render_node(doc.root, "root", index))
-
-    if compiled.rules_by_id:
-        parts.append("<h2>Named rules</h2>")
-        for rid in sorted(compiled.rules_by_id):
-            rule = compiled.rules_by_id[rid]
-            anchor = esc(rid).replace(":", "--")
-            head = esc(rule.label or rid)
-            sub = (f"<span class='mut'> — {esc(rid)}</span>"
-                   if rule.label else "")
-            tree = _render_node(rule.root, f"rule:{rid}", index)
-            result = index.get(f"rule:{rid}") if index else None
-            chip = _chip(result, index is not None)
-            parts.append(
-                f"<div class='card' id='rule-{anchor}'>"
-                f"<div class='row'><span class='lbl'>{head}{sub}</span>"
-                f"{chip}</div>{tree}</div>"
-            )
+    parts.append(_rules_cards(compiled, index))
 
     return _page(doc.name, "".join(parts))
 
@@ -335,6 +429,102 @@ def registry_page(session: Session = Depends(get_session)) -> str:
     return _page("Rule sets", body)
 
 
+# Authoring. Registered before /{name} so it isn't shadowed — side effect:
+# a rule set literally named 'new' is unreachable in the UI. POC ceiling.
+
+_STARTER_DOC = {
+    "name": "my-ruleset",
+    "description": "Describe the decision this rule set makes.",
+    "root": {"kind": "comparison", "fact": "age", "operator": "ge",
+             "value": 18},
+}
+
+
+def _authoring_page(
+    doc_json: str,
+    error: str | None = None,
+    errors: list[str] | None = None,
+    preview: str | None = None,
+) -> str:
+    parts = [
+        "<h1>New rule set version</h1>",
+        "<p class='mut'>Publishing always creates a new immutable version "
+        "(append-only). Validate previews without saving.</p>",
+    ]
+    if error:
+        parts.append(f"<div class='err'>{esc(error)}</div>")
+    if errors:
+        items = "".join(f"<li>{esc(e)}</li>" for e in errors)
+        parts.append(f"<div class='err'>Compile errors:<ul>{items}</ul></div>")
+    parts.append(
+        f"<form method='post' action='/ui/new'>"
+        f"<textarea name='doc_json' style='min-height:320px'>"
+        f"{esc(doc_json)}</textarea>"
+        f"<div class='actions'>"
+        f"<button type='submit' name='action' value='validate'>"
+        f"Validate &amp; preview</button>"
+        f"<button type='submit' name='action' value='publish'>"
+        f"Publish</button>"
+        f"<label class='mut'><input type='checkbox' name='draft' value='1'> "
+        f"publish as draft</label>"
+        f"</div></form>"
+    )
+    if preview:
+        parts.append("<h2>Preview</h2>" + preview)
+    return _page("New rule set", "".join(parts))
+
+
+@router.get("/new", response_class=HTMLResponse)
+def authoring_page(
+    from_: str | None = Query(default=None, alias="from"),
+    version: int | None = Query(default=None),
+    session: Session = Depends(get_session),
+) -> str:
+    """Create a rule set — or, with ?from=<name>&version=<n>, edit an
+    existing version by prefilling it (publishing creates a new version)."""
+    if from_:
+        row = storage.get_version(session, from_, version)
+        if row is None:
+            raise HTTPException(404, f"rule set '{from_}' not found")
+        doc_json = json.dumps(row.document, indent=2)
+    else:
+        doc_json = json.dumps(_STARTER_DOC, indent=2)
+    return _authoring_page(doc_json)
+
+
+@router.post("/new", response_class=HTMLResponse)
+def authoring_submit(
+    doc_json: str = Form(...),
+    action: str = Form(...),
+    draft: str | None = Form(default=None),
+    session: Session = Depends(get_session),
+):
+    try:
+        doc = AuthoringDocument.model_validate(json.loads(doc_json))
+        compiled = compile_document(doc, storage.import_resolver(session))
+    except CompileError as e:
+        return _authoring_page(doc_json, errors=e.errors)
+    except (ValueError, json.JSONDecodeError) as e:
+        return _authoring_page(doc_json, error=f"Invalid document: {e}")
+
+    if action == "validate":
+        preview = (_render_node(doc.root, "root", None)
+                   + _rules_cards(compiled, None))
+        return _authoring_page(doc_json, preview=preview)
+
+    # ponytail: duplicated from main.publish_ruleset; extract if it grows
+    if doc.imports:
+        doc = doc.model_copy(update={"imports": [
+            ImportSpec(ruleset=s.ruleset,
+                       version=compiled.resolved_imports[s.ruleset])
+            for s in doc.imports
+        ]})
+    row = storage.publish_version(
+        session, doc, status="draft" if draft else "published")
+    return RedirectResponse(f"/ui/{doc.name}?version={row.version}",
+                            status_code=303)
+
+
 @router.get("/{name}", response_class=HTMLResponse)
 def document_page(
     name: str,
@@ -347,29 +537,171 @@ def document_page(
 
 
 @router.post("/{name}/evaluate", response_class=HTMLResponse)
-def evaluate_page(
+async def evaluate_page(
     name: str,
-    facts_json: str = Form(...),
+    request: Request,
     version: int | None = Query(default=None),
     session: Session = Depends(get_session),
 ) -> str:
+    # async + request.form(): the per-fact fields (f:<name>, s:<name>) are
+    # dynamic, so they can't be declared as Form(...) parameters.
     row, compiled = _load(session, name, version)
     versions = storage.list_versions(session, name)
+    form = await request.form()
+    facts_json = str(form.get("facts_json") or "")
+    statements_json = str(form.get("statements_json") or "")
+    threshold = DEFAULT_CONFIDENCE_THRESHOLD
 
+    # Merge order, least to most explicit: statements < raw facts JSON
+    # < per-fact form rows (same direction as the JSON API).
+    facts: dict[str, FactInput] = {}
     try:
-        raw = json.loads(facts_json)
-        if not isinstance(raw, dict):
-            raise ValueError("facts must be a JSON object")
-        raw = {k: v for k, v in raw.items() if v is not None}
-        facts = coerce_facts(raw)
+        raw_thr = str(form.get("confidence_threshold") or "")
+        if raw_thr:
+            threshold = float(raw_thr)
+
+        if statements_json.strip():
+            stmts_raw = json.loads(statements_json)
+            if not isinstance(stmts_raw, list):
+                raise ValueError("statements must be a JSON array")
+            stmts = [Statement.model_validate(s) for s in stmts_raw]
+            facts.update(resolve_facts(stmts, threshold))
+
+        if facts_json.strip():
+            raw = json.loads(facts_json)
+            if not isinstance(raw, dict):
+                raise ValueError("facts must be a JSON object")
+            raw = {k: v for k, v in raw.items() if v is not None}
+            facts.update(coerce_facts(raw))
+
+        for key, val in form.items():
+            if not key.startswith("f:"):
+                continue
+            fname = key[2:]
+            status = str(form.get(f"s:{fname}") or "known")
+            if status != "known":
+                facts[fname] = FactInput(status=FactStatus(status))
+                continue
+            sval = str(val).strip()
+            if not sval:
+                continue  # empty + known = not provided
+            try:
+                value = json.loads(sval)
+            except json.JSONDecodeError:
+                value = sval  # bare text is fine
+            if value is None:
+                continue
+            facts[fname] = FactInput(value=value)
     except (ValueError, json.JSONDecodeError) as e:
         return _document_page(row, compiled, versions,
-                              facts_json=facts_json, error=f"Invalid facts: {e}")
+                              facts_json=facts_json or None,
+                              statements_json=statements_json or None,
+                              threshold=threshold,
+                              error=f"Invalid facts: {e}")
 
     evaluator = Evaluator(facts, compiled.rules_by_id)
     report = evaluator.report(compiled.doc, version=row.version)
     storage.record_evaluation(
-        session, row.id, raw, report.model_dump(mode="json")
+        session, row.id,
+        {k: fi.model_dump(mode="json") for k, fi in facts.items()},
+        report.model_dump(mode="json"),
     )
     return _document_page(row, compiled, versions, report=report,
-                          facts_json=facts_json)
+                          facts_json=facts_json or None,
+                          statements_json=statements_json or None,
+                          threshold=threshold)
+
+
+@router.post("/{name}/promote", response_class=HTMLResponse)
+def promote_page(
+    name: str,
+    version: int = Query(...),
+    session: Session = Depends(get_session),
+):
+    try:
+        row = storage.promote_version(session, name, version)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    if row is None:
+        raise HTTPException(404, f"'{name}' version {version} not found")
+    return RedirectResponse(f"/ui/{name}?version={version}", status_code=303)
+
+
+@router.get("/{name}/history", response_class=HTMLResponse)
+def history_page(
+    name: str, session: Session = Depends(get_session)
+) -> str:
+    if not storage.list_versions(session, name):
+        raise HTTPException(404, f"rule set '{name}' not found")
+    title = f"{name} — history"
+    records = storage.list_evaluations(session, name)
+    if not records:
+        return _page(title, f"<h1>{esc(title)}</h1>"
+                     "<p class='mut'>No evaluations yet.</p>")
+    rows = []
+    for rec, vnum in records:
+        text, cls = _DECISION_LABEL[rec.report["decision"]]
+        rows.append(
+            f"<tr><td>{esc(rec.created_at.strftime('%Y-%m-%d %H:%M:%S'))}</td>"
+            f"<td><a href='/ui/{esc(name)}?version={vnum}'>v{vnum}</a></td>"
+            f"<td><span class='chip {cls}'>{esc(text)}</span></td>"
+            f"<td><a href='/ui/{esc(name)}/evaluations/{rec.id}'>view</a>"
+            f"</td></tr>")
+    return _page(title, f"<h1>{esc(title)}</h1><table>"
+                 "<tr><th>Time</th><th>Version</th><th>Decision</th><th></th>"
+                 f"</tr>{''.join(rows)}</table>")
+
+
+@router.get("/{name}/evaluations/{eval_id}", response_class=HTMLResponse)
+def evaluation_detail_page(
+    name: str, eval_id: int, session: Session = Depends(get_session)
+) -> str:
+    found = storage.get_evaluation(session, name, eval_id)
+    if found is None:
+        raise HTTPException(404, f"evaluation {eval_id} not found "
+                            f"for '{name}'")
+    rec, vrow = found
+    doc = AuthoringDocument.model_validate(vrow.document)
+    # Stored imports are pinned, so this replays against exact versions.
+    compiled = compile_document(doc, storage.import_resolver(session))
+    versions = storage.list_versions(session, name)
+    report = EvaluationReport.model_validate(rec.report)
+    when = rec.created_at.strftime('%Y-%m-%d %H:%M:%S')
+    return _document_page(vrow, compiled, versions, report=report,
+                          note=f"Historical evaluation #{rec.id} from {when}")
+
+
+@router.get("/{name}/diff", response_class=HTMLResponse)
+def diff_page(
+    name: str,
+    a: int = Query(...),
+    b: int = Query(...),
+    session: Session = Depends(get_session),
+) -> str:
+    ra = storage.get_version(session, name, a)
+    rb = storage.get_version(session, name, b)
+    if ra is None or rb is None:
+        missing = a if ra is None else b
+        raise HTTPException(404, f"'{name}' version {missing} not found")
+    title = f"{name}: v{a} → v{b}"
+    lines = list(difflib.unified_diff(
+        json.dumps(ra.document, indent=2, sort_keys=True).splitlines(),
+        json.dumps(rb.document, indent=2, sort_keys=True).splitlines(),
+        fromfile=f"v{a}", tofile=f"v{b}", lineterm=""))
+    if not lines:
+        return _page(title, f"<h1>{esc(title)}</h1>"
+                     "<p class='mut'>No differences.</p>")
+    out = []
+    for ln in lines:
+        e = esc(ln)
+        if ln.startswith("+++") or ln.startswith("---"):
+            out.append(e)
+        elif ln.startswith("+"):
+            out.append(f"<span class='dadd'>{e}</span>")
+        elif ln.startswith("-"):
+            out.append(f"<span class='ddel'>{e}</span>")
+        else:
+            out.append(e)
+    body = "\n".join(out)
+    return _page(title, f"<h1>{esc(title)}</h1>"
+                 f"<pre class='diff'>{body}</pre>")
