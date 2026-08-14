@@ -88,6 +88,29 @@ class TestNotAndFacts:
         assert status_of(root, {"age": "thirty"}) is RuleStatus.ERROR
 
 
+class TestBetween:
+    ROOT = {"kind": "comparison", "fact": "age", "operator": "between",
+            "value": [18, 65]}
+
+    def test_inclusive_boundaries(self):
+        for age in (18, 34, 65):
+            assert status_of(self.ROOT, {"age": age}) is RuleStatus.SATISFIED
+        for age in (17, 66):
+            assert status_of(self.ROOT, {"age": age}) is RuleStatus.FAILED
+
+    def test_unknown_fact_is_unknown(self):
+        assert status_of(self.ROOT, {}) is RuleStatus.UNKNOWN
+
+    def test_type_mismatch_is_error(self):
+        assert status_of(self.ROOT, {"age": "thirty"}) is RuleStatus.ERROR
+
+    @pytest.mark.parametrize("value", [18, [18], [1, 2, 3], "18-65"])
+    def test_value_must_be_two_item_list(self, value):
+        with pytest.raises(ValueError, match="two-item list"):
+            doc({"kind": "comparison", "fact": "age",
+                 "operator": "between", "value": value})
+
+
 class TestApi:
     @pytest.fixture()
     def client(self, tmp_path, monkeypatch):

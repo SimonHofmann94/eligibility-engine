@@ -65,6 +65,7 @@ _OPS: dict[str, tuple[str, Callable[[Any, Any], bool]]] = {
     "le": ("≤", _op.le),
     "in": ("in", lambda a, b: a in b),
     "not_in": ("not in", lambda a, b: a not in b),
+    "between": ("between", lambda a, b: b[0] <= a <= b[1]),
 }
 
 

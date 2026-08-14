@@ -22,7 +22,12 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
 from . import storage
-from .compiler import CompiledDocument, CompileError, compile_document
+from .compiler import (
+    CompiledDocument,
+    CompileError,
+    compile_document,
+    pin_imports,
+)
 from .evaluator import _OPS, Evaluator
 from .models import (
     AllBlock,
@@ -32,7 +37,6 @@ from .models import (
     ConditionalRequirement,
     FactInput,
     FactStatus,
-    ImportSpec,
     NotBlock,
     OneOfBlock,
     RuleRef,
@@ -46,6 +50,14 @@ router = APIRouter(prefix="/ui", include_in_schema=False)
 
 def esc(x) -> str:
     return html.escape(str(x))
+
+
+def _parse_scalar(s: str):
+    """JSON if it parses, bare string otherwise — '34'→int, 'Germany'→str."""
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        return s
 
 
 _CSS = """
@@ -336,6 +348,8 @@ def _document_page(
     actions = [
         f"<a href='/ui/new?from={esc(doc.name)}&version={row.version}'>"
         f"Edit as new version</a>",
+        f"<a href='/ui/build?from={esc(doc.name)}&version={row.version}'>"
+        f"Edit in builder</a>",
         f"<a href='/ui/{esc(doc.name)}/history'>History</a>",
     ]
     prior = [v.version for v in all_versions if v.version < row.version]
@@ -430,7 +444,8 @@ def registry_page(session: Session = Depends(get_session)) -> str:
 
 
 # Authoring. Registered before /{name} so it isn't shadowed — side effect:
-# a rule set literally named 'new' is unreachable in the UI. POC ceiling.
+# rule sets literally named 'new' or 'build' are unreachable in the UI.
+# POC ceiling.
 
 _STARTER_DOC = {
     "name": "my-ruleset",
@@ -467,6 +482,8 @@ def _authoring_page(
         f"Publish</button>"
         f"<label class='mut'><input type='checkbox' name='draft' value='1'> "
         f"publish as draft</label>"
+        f"<button type='submit' name='action' value='tobuilder'>"
+        f"Open in builder</button>"
         f"</div></form>"
     )
     if preview:
@@ -499,6 +516,17 @@ def authoring_submit(
     draft: str | None = Form(default=None),
     session: Session = Depends(get_session),
 ):
+    if action == "tobuilder":
+        # Hand off to the builder — must not require a compilable document,
+        # only parseable JSON (the builder edits raw dicts).
+        try:
+            doc_raw = json.loads(doc_json)
+            if not isinstance(doc_raw, dict):
+                raise ValueError("document must be a JSON object")
+        except (ValueError, json.JSONDecodeError) as e:
+            return _authoring_page(doc_json, error=f"Invalid document: {e}")
+        return _builder_page(doc_raw)
+
     try:
         doc = AuthoringDocument.model_validate(json.loads(doc_json))
         compiled = compile_document(doc, storage.import_resolver(session))
@@ -512,17 +540,360 @@ def authoring_submit(
                    + _rules_cards(compiled, None))
         return _authoring_page(doc_json, preview=preview)
 
-    # ponytail: duplicated from main.publish_ruleset; extract if it grows
-    if doc.imports:
-        doc = doc.model_copy(update={"imports": [
-            ImportSpec(ruleset=s.ruleset,
-                       version=compiled.resolved_imports[s.ruleset])
-            for s in doc.imports
-        ]})
+    doc = pin_imports(doc, compiled)
     row = storage.publish_version(
         session, doc, status="draft" if draft else "published")
     return RedirectResponse(f"/ui/{doc.name}?version={row.version}",
                             status_code=303)
+
+
+# ---------------------------------------------------------------------------
+# Block builder — server-round-trip structural editing on the raw document
+# dict (hidden doc_json field carries the structure; visible inputs carry
+# scalars; each POST overlays scalars, applies one structural action, and
+# re-renders). Mid-edit documents may be invalid — Pydantic and the compiler
+# only run on validate/publish.
+# ---------------------------------------------------------------------------
+
+_KINDS = ("comparison", "all", "any", "one_of", "not",
+          "conditional_requirement", "rule_ref")
+
+_GROUP_HEADS = {"all": "ALL of the following",
+                "any": "AT LEAST ONE of the following",
+                "one_of": "EXACTLY ONE of the following"}
+
+
+def _stub(kind: str) -> dict:
+    if kind in _GROUP_HEADS:
+        return {"kind": kind, "children": [_stub("comparison")]}
+    if kind == "not":
+        return {"kind": "not", "child": _stub("comparison")}
+    if kind == "conditional_requirement":
+        return {"kind": "conditional_requirement",
+                "when": _stub("comparison"), "require": _stub("comparison")}
+    if kind == "rule_ref":
+        return {"kind": "rule_ref", "rule": ""}
+    return {"kind": "comparison", "fact": "", "operator": "eq", "value": ""}
+
+
+def _resolve(doc: dict, path: str) -> tuple:
+    """(container, key) so that container[key] is the node at `path`.
+
+    Heads: 'root' or 'rules[<i>]' (a named rule's tree — index-based, so a
+    simultaneous id edit can't invalidate the path); segments:
+    'children[<j>]', 'child', 'when', 'require'."""
+    head, _, rest = path.partition(".")
+    if head == "root":
+        container, key = doc, "root"
+    elif head.startswith("rules[") and head.endswith("]"):
+        container, key = doc["rules"][int(head[6:-1])], "root"
+    else:
+        raise ValueError(f"bad path head: {head!r}")
+    for seg in rest.split(".") if rest else []:
+        container = container[key]
+        if seg.startswith("children[") and seg.endswith("]"):
+            container, key = container["children"], int(seg[9:-1])
+        elif seg in ("child", "when", "require"):
+            key = seg
+        else:
+            raise ValueError(f"bad path segment: {seg!r}")
+    return container, key
+
+
+def _overlay_scalars(doc: dict, form) -> None:
+    """Apply every visible input onto the parsed doc. Structure is never
+    touched here, so the indices encoded in buttons at render time stay
+    valid until the structural action runs."""
+    for key, val in form.items():
+        val = str(val)
+        if key == "d:name":
+            doc["name"] = val.strip()
+        elif key == "d:description":
+            doc["description"] = val.strip() or None
+        elif key.startswith("i:"):
+            _, idx, attr = key.split(":", 2)
+            spec = doc["imports"][int(idx)]
+            if attr == "ruleset":
+                spec["ruleset"] = val.strip()
+            elif attr == "version":
+                spec["version"] = int(val) if val.strip() else None
+        elif key.startswith("r:"):
+            _, idx, attr = key.split(":", 2)
+            rule = doc["rules"][int(idx)]
+            if attr in ("id", "automation"):
+                rule[attr] = val.strip()
+            elif attr == "label":
+                rule["label"] = val.strip() or None
+        elif key.startswith("n:"):
+            _, path, attr = key.split(":", 2)
+            container, k = _resolve(doc, path)
+            node = container[k]
+            if attr == "label":
+                node["label"] = val.strip() or None
+            elif attr in ("fact", "operator", "rule"):
+                node[attr] = val.strip()
+            elif attr == "value":
+                node["value"] = _parse_scalar(val.strip())
+
+
+def _kind_select(path: str, current: str | None) -> str:
+    opts = "".join(
+        f"<option value='{k}'{' selected' if k == current else ''}>"
+        f"{k.replace('_', ' ')}</option>" for k in _KINDS)
+    return f"<select name='k:{path}'>{opts}</select>"
+
+
+def _node_footer(path: str, node: dict) -> str:
+    kind = node.get("kind")
+    parts = [f"<div class='actions'>{_kind_select(path, kind)}"
+             f"<button name='action' value='set:{path}'>Set kind</button>"]
+    if kind in _GROUP_HEADS:
+        parts.append(f"<button name='action' value='add:{path}'>"
+                     f"Add child</button>")
+    if path.rsplit(".", 1)[-1].startswith("children["):
+        parts.append(f"<button name='action' value='del:{path}'>"
+                     f"Delete</button>")
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def _render_edit_node(node: dict, path: str) -> str:
+    """Dict-walking mirror of _render_node with input fields. Renders any
+    structurally incomplete node without crashing; unknown kinds keep their
+    data (only doc_json carries it) and offer the kind select."""
+    kind = node.get("kind")
+    label_input = (f"<input name='n:{path}:label' placeholder='label' "
+                   f"value='{esc(node.get('label') or '')}'>")
+
+    if kind == "comparison":
+        value = node.get("value")
+        value_attr = "" if value == "" else esc(json.dumps(value))
+        op = node.get("operator", "eq")
+        op_opts = "".join(
+            f"<option value='{o}'{' selected' if o == op else ''}>"
+            f"{_OPS[o][0]}</option>" for o in _OPS)
+        body = (f"<div class='row'>"
+                f"<input name='n:{path}:fact' placeholder='fact' "
+                f"value='{esc(node.get('fact') or '')}'>"
+                f"<select name='n:{path}:operator'>{op_opts}</select>"
+                f"<input name='n:{path}:value' placeholder='value' "
+                f"value='{value_attr}'></div>")
+    elif kind in _GROUP_HEADS:
+        kids = node.get("children") or []
+        inner = "".join(
+            _render_edit_node(c, f"{path}.children[{i}]")
+            for i, c in enumerate(kids)
+        ) or "<div class='mut'>no children yet — add one below</div>"
+        body = (f"<div class='hd'>{_GROUP_HEADS[kind]}</div>"
+                f"<div class='kids'>{inner}</div>")
+    elif kind == "not":
+        child = _render_edit_node(node.get("child") or {}, f"{path}.child")
+        body = (f"<div class='hd'>It is NOT the case that</div>"
+                f"<div class='kids'>{child}</div>")
+    elif kind == "conditional_requirement":
+        when = _render_edit_node(node.get("when") or {}, f"{path}.when")
+        req = _render_edit_node(node.get("require") or {}, f"{path}.require")
+        body = (f"<div class='hd'>Conditional requirement</div>"
+                f"<div class='kids'><div class='mut'>Apply only when:</div>"
+                f"{when}<div class='mut'>Then require:</div>{req}</div>")
+    elif kind == "rule_ref":
+        body = (f"<div class='row'><span>Rule:</span>"
+                f"<input name='n:{path}:rule' placeholder='rule id' "
+                f"value='{esc(node.get('rule') or '')}'></div>")
+    else:
+        return (f"<div class='node'><div class='mut'>unknown kind — "
+                f"choose one:</div>{_node_footer(path, node)}</div>")
+
+    return (f"<div class='node'>{label_input}{body}"
+            f"{_node_footer(path, node)}</div>")
+
+
+def _builder_page(
+    doc: dict,
+    error: str | None = None,
+    errors: list[str] | None = None,
+    preview: str | None = None,
+) -> str:
+    parts = [
+        "<h1>Rule set builder</h1>",
+        "<p class='mut'>Every button also applies your field edits. "
+        "'Set kind' replaces the block and discards its contents. "
+        "Publishing creates a new immutable version.</p>",
+    ]
+    if error:
+        parts.append(f"<div class='err'>{esc(error)}</div>")
+    if errors:
+        items = "".join(f"<li>{esc(e)}</li>" for e in errors)
+        parts.append(f"<div class='err'>Compile errors:<ul>{items}</ul></div>")
+
+    form = [
+        "<form method='post' action='/ui/build'>",
+        # Hidden first submit: Enter in a text field means "apply my edits
+        # and re-render", never a structural action like delete.
+        "<button type='submit' name='action' value='' hidden></button>",
+        f"<input type='hidden' name='doc_json' "
+        f"value='{esc(json.dumps(doc))}'>",
+        f"<div class='card'><div class='hd'>Document</div>"
+        f"<div class='row'><label class='mut'>name "
+        f"<input name='d:name' value='{esc(doc.get('name') or '')}'></label>"
+        f"<label class='mut'>description "
+        f"<input name='d:description' "
+        f"value='{esc(doc.get('description') or '')}'></label></div></div>",
+    ]
+
+    imp_rows = "".join(
+        f"<div class='row'>"
+        f"<input name='i:{i}:ruleset' placeholder='ruleset' "
+        f"value='{esc(s.get('ruleset') or '')}'>"
+        f"<input name='i:{i}:version' type='number' placeholder='latest' "
+        f"value='{s.get('version') or ''}'>"
+        f"<button name='action' value='delimport:{i}'>Remove</button></div>"
+        for i, s in enumerate(doc.get("imports") or [])
+    )
+    form.append(
+        f"<div class='card'><div class='hd'>Imports</div>{imp_rows}"
+        f"<div class='actions'>"
+        f"<button name='action' value='addimport'>Add import</button>"
+        f"</div></div>")
+
+    form.append("<h2>Decision</h2>")
+    form.append(_render_edit_node(doc.get("root") or _stub("comparison"),
+                                  "root"))
+
+    rules = doc.get("rules") or []
+    if rules:
+        form.append("<h2>Named rules</h2>")
+    for i, rule in enumerate(rules):
+        auto = rule.get("automation", "automatic")
+        auto_opts = "".join(
+            f"<option value='{a}'{' selected' if a == auto else ''}>{a}"
+            f"</option>" for a in ("automatic", "assisted", "manual"))
+        tree = _render_edit_node(rule.get("root") or _stub("comparison"),
+                                 f"rules[{i}]")
+        form.append(
+            f"<div class='card'><div class='row'>"
+            f"<label class='mut'>id <input name='r:{i}:id' "
+            f"value='{esc(rule.get('id') or '')}'></label>"
+            f"<label class='mut'>label <input name='r:{i}:label' "
+            f"value='{esc(rule.get('label') or '')}'></label>"
+            f"<label class='mut'>automation "
+            f"<select name='r:{i}:automation'>{auto_opts}</select></label>"
+            f"<button name='action' value='delrule:{i}'>Remove rule</button>"
+            f"</div>{tree}</div>")
+    form.append(
+        "<div class='actions'>"
+        "<button name='action' value='addrule'>Add named rule</button>"
+        "</div>")
+
+    form.append(
+        "<p class='mut'>values are JSON, bare text is fine — "
+        "between takes [18, 65], in takes a list</p>"
+        "<div class='actions'>"
+        "<button name='action' value='validate'>Validate &amp; preview"
+        "</button>"
+        "<button name='action' value='publish'>Publish</button>"
+        "<label class='mut'><input type='checkbox' name='draft' value='1'> "
+        "publish as draft</label>"
+        "<button name='action' value='tojson'>Open in JSON editor</button>"
+        "</div></form>")
+    parts.extend(form)
+
+    if preview:
+        parts.append("<h2>Preview</h2>" + preview)
+    return _page("Rule set builder", "".join(parts))
+
+
+@router.get("/build", response_class=HTMLResponse)
+def builder_get(
+    from_: str | None = Query(default=None, alias="from"),
+    version: int | None = Query(default=None),
+    session: Session = Depends(get_session),
+) -> str:
+    """Render-only; all mutation happens in POST on the doc_json state."""
+    if from_:
+        row = storage.get_version(session, from_, version)
+        if row is None:
+            raise HTTPException(404, f"rule set '{from_}' not found")
+        return _builder_page(row.document)
+    return _builder_page(dict(_STARTER_DOC))
+
+
+@router.post("/build", response_class=HTMLResponse)
+async def builder_submit(
+    request: Request,
+    session: Session = Depends(get_session),
+):
+    form = await request.form()
+    raw = str(form.get("doc_json") or "")
+    action = str(form.get("action") or "")
+
+    try:
+        doc = json.loads(raw)
+        if not isinstance(doc, dict):
+            raise ValueError("document must be a JSON object")
+    except (ValueError, json.JSONDecodeError):
+        return _authoring_page(raw, error="builder state unreadable — "
+                               "fix it here as JSON")
+
+    # Overlay + one structural action; only reachable errors are tampered
+    # paths/indices — re-render with a banner, never a 500.
+    try:
+        _overlay_scalars(doc, form)
+        verb, _, arg = action.partition(":")
+        if verb == "add":
+            container, key = _resolve(doc, arg)
+            kind = str(form.get(f"k:{arg}") or "comparison")
+            container[key].setdefault("children", []).append(_stub(kind))
+        elif verb == "set":
+            container, key = _resolve(doc, arg)
+            kind = str(form.get(f"k:{arg}") or "comparison")
+            container[key] = _stub(kind)
+        elif verb == "del":
+            container, key = _resolve(doc, arg)
+            if not isinstance(key, int):
+                raise ValueError("only list children can be deleted")
+            container.pop(key)
+        elif verb == "addrule":
+            rules = doc.setdefault("rules", [])
+            ids = {r.get("id") for r in rules}
+            n = 1
+            while f"rule-{n}" in ids:
+                n += 1
+            rules.append({"id": f"rule-{n}", "root": _stub("comparison")})
+        elif verb == "delrule":
+            doc.setdefault("rules", []).pop(int(arg))
+        elif verb == "addimport":
+            doc.setdefault("imports", []).append(
+                {"ruleset": "", "version": None})
+        elif verb == "delimport":
+            doc.setdefault("imports", []).pop(int(arg))
+    except (KeyError, IndexError, TypeError, ValueError) as e:
+        return _builder_page(doc, error=f"could not apply edit: {e}")
+
+    if action == "tojson":
+        return _authoring_page(json.dumps(doc, indent=2))
+
+    if action in ("validate", "publish"):
+        try:
+            typed = AuthoringDocument.model_validate(doc)
+            compiled = compile_document(typed,
+                                        storage.import_resolver(session))
+        except CompileError as e:
+            return _builder_page(doc, errors=e.errors)
+        except ValueError as e:
+            return _builder_page(doc, error=f"Invalid document: {e}")
+        if action == "validate":
+            preview = (_render_node(typed.root, "root", None)
+                       + _rules_cards(compiled, None))
+            return _builder_page(doc, preview=preview)
+        typed = pin_imports(typed, compiled)
+        row = storage.publish_version(
+            session, typed,
+            status="draft" if form.get("draft") else "published")
+        return RedirectResponse(f"/ui/{typed.name}?version={row.version}",
+                                status_code=303)
+
+    return _builder_page(doc)
 
 
 @router.get("/{name}", response_class=HTMLResponse)
@@ -585,10 +956,7 @@ async def evaluate_page(
             sval = str(val).strip()
             if not sval:
                 continue  # empty + known = not provided
-            try:
-                value = json.loads(sval)
-            except json.JSONDecodeError:
-                value = sval  # bare text is fine
+            value = _parse_scalar(sval)
             if value is None:
                 continue
             facts[fname] = FactInput(value=value)

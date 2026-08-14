@@ -76,16 +76,30 @@ class _BaseBlock(BaseModel):
     label: str | None = None
 
 
-Operator = Literal["eq", "ne", "gt", "ge", "lt", "le", "in", "not_in"]
+Operator = Literal["eq", "ne", "gt", "ge", "lt", "le", "in", "not_in",
+                   "between"]
 
 
 class Comparison(_BaseBlock):
-    """'Age is at least 28' — a typed comparison against one fact."""
+    """'Age is at least 28' — a typed comparison against one fact.
+
+    'between' is the inclusive range: value = [low, high],
+    satisfied when low <= fact <= high.
+    """
 
     kind: Literal["comparison"] = "comparison"
     fact: str
     operator: Operator = "eq"
     value: Any
+
+    @model_validator(mode="after")
+    def _between_takes_range(self) -> "Comparison":
+        if self.operator == "between" and not (
+            isinstance(self.value, list) and len(self.value) == 2
+        ):
+            raise ValueError(
+                "'between' requires a two-item list value, e.g. [18, 65]")
+        return self
 
 
 class AllBlock(_BaseBlock):

@@ -22,6 +22,7 @@ from .models import (
     AnyBlock,
     AuthoringDocument,
     ConditionalRequirement,
+    ImportSpec,
     NamedRule,
     NotBlock,
     OneOfBlock,
@@ -196,3 +197,17 @@ def compile_document(
         doc=doc, rules_by_id=rules_by_id, dependencies=deps,
         topo_order=topo, resolved_imports=resolved,
     )
+
+
+def pin_imports(
+    doc: AuthoringDocument, compiled: CompiledDocument
+) -> AuthoringDocument:
+    """Pin-on-publish: freeze the resolved import versions into the
+    document so every future evaluation replays against exact versions."""
+    if not doc.imports:
+        return doc
+    return doc.model_copy(update={"imports": [
+        ImportSpec(ruleset=s.ruleset,
+                   version=compiled.resolved_imports[s.ruleset])
+        for s in doc.imports
+    ]})

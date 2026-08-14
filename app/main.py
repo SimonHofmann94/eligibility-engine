@@ -15,9 +15,9 @@ from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from .compiler import CompileError, compile_document
+from .compiler import CompileError, compile_document, pin_imports
 from .evaluator import evaluate_document
-from .models import AuthoringDocument, ImportSpec, coerce_facts
+from .models import AuthoringDocument, coerce_facts
 from .report import EvaluationReport
 from .statements import (
     DEFAULT_CONFIDENCE_THRESHOLD,
@@ -117,12 +117,7 @@ def publish_ruleset(
     latest published library version and that pin is frozen into the stored
     document, so every future evaluation replays against exact versions."""
     compiled = _compile_or_422(doc, session)
-    if doc.imports:
-        doc = doc.model_copy(update={"imports": [
-            ImportSpec(ruleset=s.ruleset,
-                       version=compiled.resolved_imports[s.ruleset])
-            for s in doc.imports
-        ]})
+    doc = pin_imports(doc, compiled)
     row = storage.publish_version(
         session, doc, status="draft" if draft else "published"
     )
